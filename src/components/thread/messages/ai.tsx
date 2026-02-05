@@ -1,7 +1,7 @@
 import { parsePartialJson } from "@langchain/core/output_parsers";
 import { useStreamContext } from "@/providers/Stream";
 import { AIMessage, Checkpoint, Message } from "@langchain/langgraph-sdk";
-import { getContentString } from "../utils";
+import { getContentString, getReasoningString } from "../utils";
 import { BranchSwitcher, CommandBar } from "./shared";
 import { MarkdownText } from "../markdown-text";
 import { LoadExternalComponent } from "@langchain/langgraph-sdk/react-ui";
@@ -109,6 +109,7 @@ export function AssistantMessage({
 }) {
   const content = message?.content ?? [];
   const contentString = getContentString(content);
+  const reasoningString = getReasoningString(message);
   const [hideToolCalls] = useQueryState(
     "hideToolCalls",
     parseAsBoolean.withDefault(false),
@@ -159,6 +160,17 @@ export function AssistantMessage({
           </>
         ) : (
           <>
+            {reasoningString.length > 0 && (
+              <details className="rounded-md border border-border/60 bg-muted/40 px-3 py-2">
+                <summary className="cursor-pointer select-none text-sm font-medium text-muted-foreground">
+                  Reasoning
+                </summary>
+                <div className="pt-2">
+                  <MarkdownText>{reasoningString}</MarkdownText>
+                </div>
+              </details>
+            )}
+
             {contentString.length > 0 && (
               <div className="py-1">
                 <MarkdownText>{contentString}</MarkdownText>
