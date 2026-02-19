@@ -14,9 +14,10 @@ import {
   clearStoredTokens,
   getStoredSessionToken,
   getStoredUserToken,
-  loginAndCreateSession,
-  registerAndCreateSession,
+  loginUser,
+  registerUser,
   storeSessionToken,
+  storeUserToken,
 } from "@/lib/auth";
 
 export type ChatMessage = {
@@ -30,6 +31,7 @@ type StreamContextType = {
   isLoading: boolean;
   error?: string;
   hasSession: boolean;
+  hasUser: boolean;
   sessions: SessionItem[];
   sessionsLoading: boolean;
   currentSessionId: string | null;
@@ -39,13 +41,15 @@ type StreamContextType = {
   register: (email: string, password: string) => Promise<void>;
   logout: () => void;
   refreshSessions: () => Promise<void>;
-  createSession: () => Promise<void>;
-  selectSession: (session: SessionItem) => void;
+  createSession: (name?: string, options?: { preserveMessages?: boolean }) => Promise<SessionItem | void>;
+  selectSession: (session: SessionItem, options?: { preserveMessages?: boolean }) => void;
+  deleteSession: (session: SessionItem) => Promise<void>;
 };
 
 const StreamContext = createContext<StreamContextType | undefined>(undefined);
 
 const STREAM_PATH = "/api/v1/chatbot/chat/stream";
+const SESSION_NAME_MAX_LENGTH = 40;
 
 type SessionItem = {
   session_id: string;
@@ -55,6 +59,13 @@ type SessionItem = {
     token_type: "bearer";
     expires_at: string;
   };
+};
+
+const deriveSessionName = (text: string) => {
+  const trimmed = text.trim().replace(/\s+/g, " ");
+  if (!trimmed) return "";
+  if (trimmed.length <= SESSION_NAME_MAX_LENGTH) return trimmed;
+  return trimmed.slice(0, SESSION_NAME_MAX_LENGTH).trimEnd() + "…";
 };
 
 export const StreamProvider: React.FC<{ children: ReactNode }> = ({
@@ -88,6 +99,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   }, [messages]);
 
   const hasSession = !!sessionToken;
+  const hasUser = !!userToken;
 
   const stop = () => {
     if (abortRef.current) {
@@ -115,12 +127,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     try {
       setMessages([]);
       historyLoadedRef.current = false;
-      const session = await loginAndCreateSession(baseUrl, email, password);
-      const storedUser = getStoredUserToken();
-      if (storedUser) setUserToken(storedUser);
-      setCurrentSessionId(session.session_id);
-      setSessionToken(session.token.access_token);
-      storeSessionToken(session.token.access_token, session.session_id);
+      const loginResponse = await loginUser(baseUrl, email, password);
+      storeUserToken(loginResponse.access_token);
+      setUserToken(loginResponse.access_token);
+      setSessionToken(null);
+      setCurrentSessionId(null);
+      setSessions([]);
       await refreshSessions();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed.");
@@ -136,12 +148,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     try {
       setMessages([]);
       historyLoadedRef.current = false;
-      const session = await registerAndCreateSession(baseUrl, email, password);
-      const storedUser = getStoredUserToken();
-      if (storedUser) setUserToken(storedUser);
-      setCurrentSessionId(session.session_id);
-      setSessionToken(session.token.access_token);
-      storeSessionToken(session.token.access_token, session.session_id);
+      const registration = await registerUser(baseUrl, email, password);
+      storeUserToken(registration.token.access_token);
+      setUserToken(registration.token.access_token);
+      setSessionToken(null);
+      setCurrentSessionId(null);
+      setSessions([]);
       await refreshSessions();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed.");
@@ -210,13 +222,6 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
       }
       const data = (await res.json()) as SessionItem[];
       setSessions(data);
-      if (!currentSessionId && data.length > 0) {
-        const first = data[0];
-        setCurrentSessionId(first.session_id);
-        setSessionToken(first.token.access_token);
-        storeSessionToken(first.token.access_token, first.session_id);
-        historyLoadedRef.current = false;
-      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load sessions.");
     } finally {
@@ -224,7 +229,50 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     }
   };
 
-  const createSession = async () => {
+  const renameSession = async (
+    session: SessionItem,
+    name: string,
+    options?: { updateList?: boolean },
+  ): Promise<SessionItem | null> => {
+    const trimmed = name.trim();
+    if (!trimmed) return session;
+    const body = new URLSearchParams();
+    body.set("name", trimmed);
+    try {
+      const res = await fetch(
+        `${baseUrl}/api/v1/auth/session/${session.session_id}/name`,
+        {
+          method: "PATCH",
+          headers: {
+            Authorization: `Bearer ${session.token.access_token}`,
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body,
+        },
+      );
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || "Failed to rename session.");
+      }
+      const updated = (await res.json()) as SessionItem;
+      if (options?.updateList !== false) {
+        setSessions((prev) =>
+          prev.map((item) =>
+            item.session_id === updated.session_id ? updated : item,
+          ),
+        );
+      }
+      return updated;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rename session.");
+      return null;
+    }
+  };
+
+  const createSession = async (
+    name?: string,
+    options?: { preserveMessages?: boolean },
+  ) => {
     if (!userToken) {
       setError("Please log in to create a session.");
       return;
@@ -243,8 +291,12 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         throw new Error(detail?.detail || "Failed to create session.");
       }
       const session = (await res.json()) as SessionItem;
-      setSessions((prev) => [session, ...prev]);
-      selectSession(session);
+      const renamed =
+        name ? await renameSession(session, name, { updateList: false }) : null;
+      const finalSession = renamed ?? session;
+      setSessions((prev) => [finalSession, ...prev]);
+      selectSession(finalSession, { preserveMessages: options?.preserveMessages });
+      return finalSession;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create session.");
     } finally {
@@ -252,13 +304,52 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
     }
   };
 
-  const selectSession = (session: SessionItem) => {
+  const selectSession = (
+    session: SessionItem,
+    options?: { preserveMessages?: boolean },
+  ) => {
     stop();
     setCurrentSessionId(session.session_id);
     setSessionToken(session.token.access_token);
     storeSessionToken(session.token.access_token, session.session_id);
-    setMessages([]);
+    if (!options?.preserveMessages) {
+      setMessages([]);
+    }
     historyLoadedRef.current = false;
+  };
+
+  const deleteSession = async (session: SessionItem) => {
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      const res = await fetch(
+        `${baseUrl}/api/v1/auth/session/${session.session_id}`,
+        {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${session.token.access_token}`,
+          },
+        },
+      );
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || "Failed to delete session.");
+      }
+      setSessions((prev) =>
+        prev.filter((item) => item.session_id !== session.session_id),
+      );
+      if (currentSessionId === session.session_id) {
+        stop();
+        setCurrentSessionId(null);
+        setSessionToken(null);
+        setMessages([]);
+        historyLoadedRef.current = false;
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete session.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -268,7 +359,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   }, [userToken]);
 
   const sendMessage = async (text: string) => {
-    if (!sessionToken) {
+    if (!userToken) {
       setError("Please log in to start chatting.");
       return;
     }
@@ -296,6 +387,28 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
 
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
 
+    let activeSessionToken = sessionToken;
+    if (!activeSessionToken) {
+      const sessionName = deriveSessionName(trimmed);
+      const session = await createSession(sessionName, {
+        preserveMessages: true,
+      });
+      activeSessionToken = session?.token.access_token ?? null;
+      if (!activeSessionToken) {
+        setIsLoading(false);
+        setError("Unable to create a session.");
+        return;
+      }
+    } else if (currentSessionId) {
+      const currentSession = sessions.find(
+        (session) => session.session_id === currentSessionId,
+      );
+      if (currentSession && !currentSession.name?.trim()) {
+        const sessionName = deriveSessionName(trimmed);
+        await renameSession(currentSession, sessionName);
+      }
+    }
+
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -304,7 +417,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${sessionToken}`,
+          Authorization: `Bearer ${activeSessionToken}`,
         },
         body: JSON.stringify({
           messages: [...messagesRef.current, userMessage].map((m) => ({
@@ -386,6 +499,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         isLoading,
         error,
         hasSession,
+        hasUser,
         sessions,
         sessionsLoading,
         currentSessionId,
@@ -397,6 +511,7 @@ export const StreamProvider: React.FC<{ children: ReactNode }> = ({
         refreshSessions,
         createSession,
         selectSession,
+        deleteSession,
       }}
     >
       {children}

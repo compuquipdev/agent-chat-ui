@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useStreamContext } from "@/providers/Stream";
 import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
 import { HumanMessage } from "./messages/human";
@@ -10,6 +10,8 @@ import { Input } from "../ui/input";
 import { PasswordInput } from "../ui/password-input";
 import { Textarea } from "../ui/textarea";
 import { LangGraphLogoSVG } from "../icons/langgraph";
+import { Trash2 } from "lucide-react";
+import { useRouter, useSearchParams } from "next/navigation";
 
 export function Thread() {
   const stream = useStreamContext();
@@ -18,6 +20,7 @@ export function Thread() {
     isLoading,
     error,
     hasSession,
+    hasUser,
     sessions,
     sessionsLoading,
     currentSessionId,
@@ -28,8 +31,31 @@ export function Thread() {
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [inputError, setInputError] = useState<string | null>(null);
   const lastMessage = messages[messages.length - 1];
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const lastSessionParamRef = useRef<string | null>(null);
+  const sessionParam = searchParams.get("sessionId");
   const formatSessionLabel = (sessionId: string, name: string) =>
     name?.trim() || `Session ${sessionId.slice(0, 8)}`;
+
+  useEffect(() => {
+    if (!hasUser || sessionsLoading) return;
+    if (!sessionParam) return;
+    if (sessionParam === currentSessionId) return;
+    const matching = sessions.find((s) => s.session_id === sessionParam);
+    if (matching) {
+      stream.selectSession(matching);
+    }
+  }, [hasUser, sessionsLoading, sessionParam, currentSessionId, sessions, stream]);
+
+  useEffect(() => {
+    if (!currentSessionId) return;
+    if (lastSessionParamRef.current === currentSessionId) return;
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("sessionId", currentSessionId);
+    lastSessionParamRef.current = currentSessionId;
+    router.replace(`?${params.toString()}`);
+  }, [currentSessionId, router, searchParams]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -61,7 +87,7 @@ export function Thread() {
     setPassword("");
   };
 
-  if (!hasSession) {
+  if (!hasUser) {
     return (
       <div className="flex min-h-screen w-full items-center justify-center p-4">
         <div className="animate-in fade-in-0 zoom-in-95 bg-background flex w-full max-w-md flex-col rounded-lg border shadow-lg">
@@ -73,7 +99,7 @@ export function Thread() {
               </h1>
             </div>
             <p className="text-muted-foreground text-sm">
-              Log in to start a chat session.
+              Log in to start chatting.
             </p>
           </div>
           <form
@@ -172,18 +198,31 @@ export function Thread() {
             {sessions.map((session) => {
               const isActive = session.session_id === currentSessionId;
               return (
-                <button
+                <div
                   key={session.session_id}
-                  type="button"
-                  onClick={() => stream.selectSession(session)}
-                  className={`flex w-full items-center rounded-md px-3 py-2 text-left text-sm transition ${
+                  className={`flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm transition ${
                     isActive
                       ? "bg-white text-foreground shadow"
                       : "text-muted-foreground hover:bg-white/60 hover:text-foreground"
                   }`}
                 >
-                  {formatSessionLabel(session.session_id, session.name)}
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => stream.selectSession(session)}
+                    className="flex-1 text-left"
+                  >
+                    {formatSessionLabel(session.session_id, session.name)}
+                  </button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => stream.deleteSession(session)}
+                    title="Delete session"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
               );
             })}
           </div>
@@ -210,7 +249,9 @@ export function Thread() {
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
           {messages.length === 0 && (
             <div className="text-muted-foreground text-sm">
-              Send a message to start the conversation.
+              {hasSession
+                ? "Send a message to start the conversation."
+                : "Send your first message to create a new session."}
             </div>
           )}
           {messages.map((message) => {
