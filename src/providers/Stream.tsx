@@ -1,283 +1,412 @@
+"use client";
+
 import React, {
   createContext,
   useContext,
-  ReactNode,
-  useState,
   useEffect,
+  useMemo,
+  useRef,
+  useState,
+  ReactNode,
 } from "react";
-import { useStream } from "@langchain/langgraph-sdk/react";
-import { type Message } from "@langchain/langgraph-sdk";
+import { v4 as uuidv4 } from "uuid";
 import {
-  uiMessageReducer,
-  isUIMessage,
-  isRemoveUIMessage,
-  type UIMessage,
-  type RemoveUIMessage,
-} from "@langchain/langgraph-sdk/react-ui";
-import { useQueryState } from "nuqs";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import { LangGraphLogoSVG } from "@/components/icons/langgraph";
-import { Label } from "@/components/ui/label";
-import { ArrowRight } from "lucide-react";
-import { PasswordInput } from "@/components/ui/password-input";
-import { getApiKey } from "@/lib/api-key";
-import { useThreads } from "./Thread";
-import { toast } from "sonner";
+  clearStoredTokens,
+  getStoredSessionToken,
+  getStoredUserToken,
+  loginAndCreateSession,
+  registerAndCreateSession,
+  storeSessionToken,
+} from "@/lib/auth";
 
-export type StateType = { messages: Message[]; ui?: UIMessage[] };
+export type ChatMessage = {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+};
 
-const useTypedStream = useStream<
-  StateType,
-  {
-    UpdateType: {
-      messages?: Message[] | Message | string;
-      ui?: (UIMessage | RemoveUIMessage)[] | UIMessage | RemoveUIMessage;
-      context?: Record<string, unknown>;
-    };
-    CustomEventType: UIMessage | RemoveUIMessage;
-  }
->;
+type StreamContextType = {
+  messages: ChatMessage[];
+  isLoading: boolean;
+  error?: string;
+  hasSession: boolean;
+  sessions: SessionItem[];
+  sessionsLoading: boolean;
+  currentSessionId: string | null;
+  sendMessage: (text: string) => Promise<void>;
+  stop: () => void;
+  login: (email: string, password: string) => Promise<void>;
+  register: (email: string, password: string) => Promise<void>;
+  logout: () => void;
+  refreshSessions: () => Promise<void>;
+  createSession: () => Promise<void>;
+  selectSession: (session: SessionItem) => void;
+};
 
-type StreamContextType = ReturnType<typeof useTypedStream>;
 const StreamContext = createContext<StreamContextType | undefined>(undefined);
 
-async function sleep(ms = 4000) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const STREAM_PATH = "/api/v1/chatbot/chat/stream";
 
-async function checkGraphStatus(
-  apiUrl: string,
-  apiKey: string | null,
-): Promise<boolean> {
-  try {
-    const res = await fetch(`${apiUrl}/info`, {
-      ...(apiKey && {
-        headers: {
-          "X-Api-Key": apiKey,
-        },
-      }),
-    });
+type SessionItem = {
+  session_id: string;
+  name: string;
+  token: {
+    access_token: string;
+    token_type: "bearer";
+    expires_at: string;
+  };
+};
 
-    return res.ok;
-  } catch (e) {
-    console.error(e);
-    return false;
-  }
-}
-
-const StreamSession = ({
+export const StreamProvider: React.FC<{ children: ReactNode }> = ({
   children,
-  apiKey,
-  apiUrl,
-  assistantId,
-}: {
-  children: ReactNode;
-  apiKey: string | null;
-  apiUrl: string;
-  assistantId: string;
 }) => {
-  const [threadId, setThreadId] = useQueryState("threadId");
-  const { getThreads, setThreads } = useThreads();
-  const streamValue = useTypedStream({
-    apiUrl,
-    apiKey: apiKey ?? undefined,
-    assistantId,
-    threadId: threadId ?? null,
-    fetchStateHistory: true,
-    onCustomEvent: (event, options) => {
-      if (isUIMessage(event) || isRemoveUIMessage(event)) {
-        options.mutate((prev) => {
-          const ui = uiMessageReducer(prev.ui ?? [], event);
-          return { ...prev, ui };
-        });
-      }
-    },
-    onThreadId: (id) => {
-      setThreadId(id);
-      // Refetch threads list when thread ID changes.
-      // Wait for some seconds before fetching so we're able to get the new thread that was created.
-      sleep().then(() => getThreads().then(setThreads).catch(console.error));
-    },
-  });
+  const baseUrl = useMemo(
+    () => process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000",
+    [],
+  );
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const messagesRef = useRef<ChatMessage[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | undefined>(undefined);
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [userToken, setUserToken] = useState<string | null>(null);
+  const [sessionToken, setSessionToken] = useState<string | null>(null);
+  const historyLoadedRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    checkGraphStatus(apiUrl, apiKey).then((ok) => {
-      if (!ok) {
-        toast.error("Failed to connect to LangGraph server", {
-          description: () => (
-            <p>
-              Please ensure your graph is running at <code>{apiUrl}</code> and
-              your API key is correctly set (if connecting to a deployed graph).
-            </p>
-          ),
-          duration: 10000,
-          richColors: true,
-          closeButton: true,
+    const stored = getStoredSessionToken();
+    if (stored) setSessionToken(stored);
+    const storedUser = getStoredUserToken();
+    if (storedUser) setUserToken(storedUser);
+  }, []);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  const hasSession = !!sessionToken;
+
+  const stop = () => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+      abortRef.current = null;
+    }
+    setIsLoading(false);
+  };
+
+  const logout = () => {
+    stop();
+    clearStoredTokens();
+    setSessionToken(null);
+    setUserToken(null);
+    setSessions([]);
+    setCurrentSessionId(null);
+    setMessages([]);
+    setError(undefined);
+    historyLoadedRef.current = false;
+  };
+
+  const login = async (email: string, password: string) => {
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      setMessages([]);
+      historyLoadedRef.current = false;
+      const session = await loginAndCreateSession(baseUrl, email, password);
+      const storedUser = getStoredUserToken();
+      if (storedUser) setUserToken(storedUser);
+      setCurrentSessionId(session.session_id);
+      setSessionToken(session.token.access_token);
+      storeSessionToken(session.token.access_token, session.session_id);
+      await refreshSessions();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Login failed.");
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const register = async (email: string, password: string) => {
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      setMessages([]);
+      historyLoadedRef.current = false;
+      const session = await registerAndCreateSession(baseUrl, email, password);
+      const storedUser = getStoredUserToken();
+      if (storedUser) setUserToken(storedUser);
+      setCurrentSessionId(session.session_id);
+      setSessionToken(session.token.access_token);
+      storeSessionToken(session.token.access_token, session.session_id);
+      await refreshSessions();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Registration failed.");
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const loadHistory = async () => {
+      if (!sessionToken || historyLoadedRef.current) return;
+      historyLoadedRef.current = true;
+      try {
+        const res = await fetch(`${baseUrl}/api/v1/chatbot/messages`, {
+          headers: {
+            Authorization: `Bearer ${sessionToken}`,
+          },
         });
+        if (res.status === 401 || res.status === 403) {
+          logout();
+          setError("Session expired. Please log in again.");
+          return;
+        }
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          throw new Error(detail?.detail || "Failed to load chat history.");
+        }
+        const data = (await res.json()) as {
+          messages?: { role: ChatMessage["role"]; content: string }[];
+        };
+        if (data?.messages?.length) {
+          setMessages(
+            data.messages.map((msg) => ({
+              id: uuidv4(),
+              role: msg.role,
+              content: msg.content,
+            })),
+          );
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to load history.");
       }
-    });
-  }, [apiKey, apiUrl]);
+    };
+
+    loadHistory();
+  }, [baseUrl, sessionToken]);
+
+  const refreshSessions = async () => {
+    if (!userToken) return;
+    setSessionsLoading(true);
+    try {
+      const res = await fetch(`${baseUrl}/api/v1/auth/sessions`, {
+        headers: {
+          Authorization: `Bearer ${userToken}`,
+        },
+      });
+      if (res.status === 401 || res.status === 403) {
+        logout();
+        setError("Session expired. Please log in again.");
+        return;
+      }
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || "Failed to load sessions.");
+      }
+      const data = (await res.json()) as SessionItem[];
+      setSessions(data);
+      if (!currentSessionId && data.length > 0) {
+        const first = data[0];
+        setCurrentSessionId(first.session_id);
+        setSessionToken(first.token.access_token);
+        storeSessionToken(first.token.access_token, first.session_id);
+        historyLoadedRef.current = false;
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load sessions.");
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  const createSession = async () => {
+    if (!userToken) {
+      setError("Please log in to create a session.");
+      return;
+    }
+    setIsLoading(true);
+    setError(undefined);
+    try {
+      const res = await fetch(`${baseUrl}/api/v1/auth/session`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${userToken}`,
+        },
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || "Failed to create session.");
+      }
+      const session = (await res.json()) as SessionItem;
+      setSessions((prev) => [session, ...prev]);
+      selectSession(session);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to create session.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const selectSession = (session: SessionItem) => {
+    stop();
+    setCurrentSessionId(session.session_id);
+    setSessionToken(session.token.access_token);
+    storeSessionToken(session.token.access_token, session.session_id);
+    setMessages([]);
+    historyLoadedRef.current = false;
+  };
+
+  useEffect(() => {
+    if (userToken) {
+      refreshSessions().catch(() => undefined);
+    }
+  }, [userToken]);
+
+  const sendMessage = async (text: string) => {
+    if (!sessionToken) {
+      setError("Please log in to start chatting.");
+      return;
+    }
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (trimmed.length > 3000) {
+      setError("Message too long (max 3000 characters).");
+      return;
+    }
+
+    setError(undefined);
+    setIsLoading(true);
+
+    const userMessage: ChatMessage = {
+      id: uuidv4(),
+      role: "user",
+      content: trimmed,
+    };
+    const assistantId = uuidv4();
+    const assistantMessage: ChatMessage = {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+    };
+
+    setMessages((prev) => [...prev, userMessage, assistantMessage]);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const res = await fetch(`${baseUrl}${STREAM_PATH}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          messages: [...messagesRef.current, userMessage].map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+        }),
+        signal: controller.signal,
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        logout();
+        setError("Session expired. Please log in again.");
+        return;
+      }
+
+      if (!res.ok || !res.body) {
+        const detail = await res.json().catch(() => ({}));
+        throw new Error(detail?.detail || "Failed to start stream.");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+
+        for (const part of parts) {
+          const lines = part.split("\n");
+          for (const line of lines) {
+            if (!line.startsWith("data:")) continue;
+            const payload = line.slice(5).trim();
+            if (!payload) continue;
+
+            let data: { content?: string; done?: boolean } | null = null;
+            try {
+              data = JSON.parse(payload);
+            } catch {
+              data = null;
+            }
+
+            if (!data) continue;
+            if (data.done) {
+              setIsLoading(false);
+              continue;
+            }
+
+            if (data.content) {
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantId
+                    ? { ...msg, content: msg.content + data.content }
+                    : msg,
+                ),
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        setError(err instanceof Error ? err.message : "Streaming failed.");
+      }
+    } finally {
+      setIsLoading(false);
+      abortRef.current = null;
+    }
+  };
 
   return (
-    <StreamContext.Provider value={streamValue}>
+    <StreamContext.Provider
+      value={{
+        messages,
+        isLoading,
+        error,
+        hasSession,
+        sessions,
+        sessionsLoading,
+        currentSessionId,
+        sendMessage,
+        stop,
+        login,
+        register,
+        logout,
+        refreshSessions,
+        createSession,
+        selectSession,
+      }}
+    >
       {children}
     </StreamContext.Provider>
   );
 };
 
-// Default values for the form
-const DEFAULT_API_URL = "http://localhost:2024";
-const DEFAULT_ASSISTANT_ID = "agent";
-
-export const StreamProvider: React.FC<{ children: ReactNode }> = ({
-  children,
-}) => {
-  // Get environment variables
-  const envApiUrl: string | undefined = process.env.NEXT_PUBLIC_API_URL;
-  const envAssistantId: string | undefined =
-    process.env.NEXT_PUBLIC_ASSISTANT_ID;
-
-  // Use URL params with env var fallbacks
-  const [apiUrl, setApiUrl] = useQueryState("apiUrl", {
-    defaultValue: envApiUrl || "",
-  });
-  const [assistantId, setAssistantId] = useQueryState("assistantId", {
-    defaultValue: envAssistantId || "",
-  });
-
-  // For API key, use localStorage with env var fallback
-  const [apiKey, _setApiKey] = useState(() => {
-    const storedKey = getApiKey();
-    return storedKey || "";
-  });
-
-  const setApiKey = (key: string) => {
-    window.localStorage.setItem("lg:chat:apiKey", key);
-    _setApiKey(key);
-  };
-
-  // Determine final values to use, prioritizing URL params then env vars
-  const finalApiUrl = apiUrl || envApiUrl;
-  const finalAssistantId = assistantId || envAssistantId;
-
-  // Show the form if we: don't have an API URL, or don't have an assistant ID
-  if (!finalApiUrl || !finalAssistantId) {
-    return (
-      <div className="flex min-h-screen w-full items-center justify-center p-4">
-        <div className="animate-in fade-in-0 zoom-in-95 bg-background flex max-w-3xl flex-col rounded-lg border shadow-lg">
-          <div className="mt-14 flex flex-col gap-2 border-b p-6">
-            <div className="flex flex-col items-start gap-2">
-              <LangGraphLogoSVG className="h-7" />
-              <h1 className="text-xl font-semibold tracking-tight">
-                Agent Chat
-              </h1>
-            </div>
-            <p className="text-muted-foreground">
-              Welcome to Agent Chat! Before you get started, you need to enter
-              the URL of the deployment and the assistant / graph ID.
-            </p>
-          </div>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-
-              const form = e.target as HTMLFormElement;
-              const formData = new FormData(form);
-              const apiUrl = formData.get("apiUrl") as string;
-              const assistantId = formData.get("assistantId") as string;
-              const apiKey = formData.get("apiKey") as string;
-
-              setApiUrl(apiUrl);
-              setApiKey(apiKey);
-              setAssistantId(assistantId);
-
-              form.reset();
-            }}
-            className="bg-muted/50 flex flex-col gap-6 p-6"
-          >
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="apiUrl">
-                Deployment URL<span className="text-rose-500">*</span>
-              </Label>
-              <p className="text-muted-foreground text-sm">
-                This is the URL of your LangGraph deployment. Can be a local, or
-                production deployment.
-              </p>
-              <Input
-                id="apiUrl"
-                name="apiUrl"
-                className="bg-background"
-                defaultValue={apiUrl || DEFAULT_API_URL}
-                required
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="assistantId">
-                Assistant / Graph ID<span className="text-rose-500">*</span>
-              </Label>
-              <p className="text-muted-foreground text-sm">
-                This is the ID of the graph (can be the graph name), or
-                assistant to fetch threads from, and invoke when actions are
-                taken.
-              </p>
-              <Input
-                id="assistantId"
-                name="assistantId"
-                className="bg-background"
-                defaultValue={assistantId || DEFAULT_ASSISTANT_ID}
-                required
-              />
-            </div>
-
-            <div className="flex flex-col gap-2">
-              <Label htmlFor="apiKey">LangSmith API Key</Label>
-              <p className="text-muted-foreground text-sm">
-                This is <strong>NOT</strong> required if using a local LangGraph
-                server. This value is stored in your browser's local storage and
-                is only used to authenticate requests sent to your LangGraph
-                server.
-              </p>
-              <PasswordInput
-                id="apiKey"
-                name="apiKey"
-                defaultValue={apiKey ?? ""}
-                className="bg-background"
-                placeholder="lsv2_pt_..."
-              />
-            </div>
-
-            <div className="mt-2 flex justify-end">
-              <Button
-                type="submit"
-                size="lg"
-              >
-                Continue
-                <ArrowRight className="size-5" />
-              </Button>
-            </div>
-          </form>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <StreamSession
-      apiKey={apiKey}
-      apiUrl={apiUrl}
-      assistantId={assistantId}
-    >
-      {children}
-    </StreamSession>
-  );
-};
-
-// Create a custom hook to use the context
 export const useStreamContext = (): StreamContextType => {
   const context = useContext(StreamContext);
-  if (context === undefined) {
+  if (!context) {
     throw new Error("useStreamContext must be used within a StreamProvider");
   }
   return context;

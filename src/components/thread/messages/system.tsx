@@ -1,11 +1,8 @@
-import { Message } from "@langchain/langgraph-sdk";
-import { getContentString } from "../utils";
 import { cn } from "@/lib/utils";
+import { ChatMessage } from "@/providers/Stream";
 
-export function SystemMessage({ message }: { message: Message }) {
-  const contentString = getContentString(message.content);
-
-  if (!contentString) return null;
+export function SystemMessage({ message }: { message: ChatMessage }) {
+  if (!message.content) return null;
 
   return (
     <div className="flex justify-center">
@@ -17,7 +14,7 @@ export function SystemMessage({ message }: { message: Message }) {
           "shadow-[0_1px_0_rgba(0,0,0,0.04)]",
         )}
       >
-        System: {contentString}
+        System: {message.content}
       </div>
     </div>
   );

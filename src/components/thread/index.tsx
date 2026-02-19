@@ -1,494 +1,264 @@
-import { v4 as uuidv4 } from "uuid";
-import { ReactNode, useEffect, useRef } from "react";
-import { motion } from "framer-motion";
-import { cn } from "@/lib/utils";
+"use client";
+
+import { useState } from "react";
 import { useStreamContext } from "@/providers/Stream";
-import { useState, FormEvent } from "react";
-import { Button } from "../ui/button";
-import { Checkpoint, Message } from "@langchain/langgraph-sdk";
 import { AssistantMessage, AssistantMessageLoading } from "./messages/ai";
 import { HumanMessage } from "./messages/human";
 import { SystemMessage } from "./messages/system";
-import {
-  DO_NOT_RENDER_ID_PREFIX,
-  ensureToolCallsHaveResponses,
-} from "@/lib/ensure-tool-responses";
+import { Button } from "../ui/button";
+import { Input } from "../ui/input";
+import { PasswordInput } from "../ui/password-input";
+import { Textarea } from "../ui/textarea";
 import { LangGraphLogoSVG } from "../icons/langgraph";
-import { TooltipIconButton } from "./tooltip-icon-button";
-import {
-  ArrowDown,
-  LoaderCircle,
-  PanelRightOpen,
-  PanelRightClose,
-  SquarePen,
-} from "lucide-react";
-import { useQueryState, parseAsBoolean } from "nuqs";
-import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
-import ThreadHistory from "./history";
-import { toast } from "sonner";
-import { useMediaQuery } from "@/hooks/useMediaQuery";
-import { Label } from "../ui/label";
-import { Switch } from "../ui/switch";
-import { GitHubSVG } from "../icons/github";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "../ui/tooltip";
-
-const formatAssistantName = (assistantId?: string | null) => {
-  if (!assistantId) return "Agent Chat";
-  const formatted = assistantId
-    .replace(/_/g, " ")
-    .split(" ")
-    .filter(Boolean)
-    .map((word) => word[0]?.toUpperCase() + word.slice(1))
-    .join(" ");
-  return formatted || "Agent Chat";
-};
-
-function StickyToBottomContent(props: {
-  content: ReactNode;
-  footer?: ReactNode;
-  className?: string;
-  contentClassName?: string;
-}) {
-  const context = useStickToBottomContext();
-  return (
-    <div
-      ref={context.scrollRef}
-      style={{ width: "100%", height: "100%" }}
-      className={props.className}
-    >
-      <div ref={context.contentRef} className={props.contentClassName}>
-        {props.content}
-      </div>
-
-      {props.footer}
-    </div>
-  );
-}
-
-function ScrollToBottom(props: { className?: string }) {
-  const { isAtBottom, scrollToBottom } = useStickToBottomContext();
-
-  if (isAtBottom) return null;
-  return (
-    <Button
-      variant="outline"
-      className={props.className}
-      onClick={() => scrollToBottom()}
-    >
-      <ArrowDown className="w-4 h-4" />
-      <span>Scroll to bottom</span>
-    </Button>
-  );
-}
-
-function OpenGitHubRepo() {
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <a
-            href="https://github.com/langchain-ai/agent-chat-ui"
-            target="_blank"
-            className="flex items-center justify-center"
-          >
-            <GitHubSVG width="24" height="24" />
-          </a>
-        </TooltipTrigger>
-        <TooltipContent side="left">
-          <p>Open GitHub repo</p>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  );
-}
 
 export function Thread() {
-  const [assistantId] = useQueryState("assistantId");
-  const [threadId, setThreadId] = useQueryState("threadId");
-  const [prompt] = useQueryState("prompt");
-  const [chatHistoryOpen, setChatHistoryOpen] = useQueryState(
-    "chatHistoryOpen",
-    parseAsBoolean.withDefault(false),
-  );
-  const [hideToolCalls, setHideToolCalls] = useQueryState(
-    "hideToolCalls",
-    parseAsBoolean.withDefault(false),
-  );
-  const [input, setInput] = useState("");
-  const showSystemMessages =
-    typeof window !== "undefined"
-      ? (window as { SHOW_SYSTEM_PROMPT_MESSAGES?: boolean })
-          .SHOW_SYSTEM_PROMPT_MESSAGES === true
-      : false;
-  const systemPrompt = (process.env.NEXT_PUBLIC_SYSTEM_PROMPT ?? "").trim();
-  const [firstTokenReceived, setFirstTokenReceived] = useState(false);
-  const isLargeScreen = useMediaQuery("(min-width: 1024px)");
-
   const stream = useStreamContext();
-  const messages = stream.messages;
-  const isLoading = stream.isLoading;
+  const {
+    messages,
+    isLoading,
+    error,
+    hasSession,
+    sessions,
+    sessionsLoading,
+    currentSessionId,
+  } = stream;
+  const [input, setInput] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [inputError, setInputError] = useState<string | null>(null);
+  const lastMessage = messages[messages.length - 1];
+  const formatSessionLabel = (sessionId: string, name: string) =>
+    name?.trim() || `Session ${sessionId.slice(0, 8)}`;
 
-  const lastError = useRef<string | undefined>(undefined);
-
-  useEffect(() => {
-    if (!stream.error) {
-      lastError.current = undefined;
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isLoading) return;
+    if (!input.trim()) {
+      setInputError("Please enter a message.");
       return;
     }
-    try {
-      const message = (stream.error as any).message;
-      if (!message || lastError.current === message) {
-        // Message has already been logged. do not modify ref, return early.
-        return;
-      }
-
-      // Message is defined, and it has not been logged yet. Save it, and send the error
-      lastError.current = message;
-      toast.error("An error occurred. Please try again.", {
-        description: (
-          <p>
-            <strong>Error:</strong> <code>{message}</code>
-          </p>
-        ),
-        richColors: true,
-        closeButton: true,
-      });
-    } catch {
-      // no-op
+    if (input.trim().length > 3000) {
+      setInputError("Message too long (max 3000 characters).");
+      return;
     }
-  }, [stream.error]);
-
-  // TODO: this should be part of the useStream hook
-  const prevMessageLength = useRef(0);
-  useEffect(() => {
-    if (
-      messages.length !== prevMessageLength.current &&
-      messages?.length &&
-      messages[messages.length - 1].type === "ai"
-    ) {
-      setFirstTokenReceived(true);
-    }
-
-    prevMessageLength.current = messages.length;
-  }, [messages]);
-
-  useEffect(() => {
-    if (prompt && !input) {
-      setInput(prompt);
-    }
-  }, [prompt, input]);
-
-  const handleSubmit = (e: FormEvent) => {
-    e.preventDefault();
-    if (!input.trim() || isLoading) return;
-    setFirstTokenReceived(false);
-
-    const newHumanMessage: Message = {
-      id: uuidv4(),
-      type: "human",
-      content: input,
-    };
-
-    const toolMessages = ensureToolCallsHaveResponses(stream.messages);
-    const hasSystemMessage = stream.messages.some((m) => m.type === "system");
-    const systemMessage: Message | null =
-      systemPrompt && !hasSystemMessage
-        ? { id: uuidv4(), type: "system", content: systemPrompt }
-        : null;
-    const outgoingMessages = [
-      ...toolMessages,
-      ...(systemMessage ? [systemMessage] : []),
-      newHumanMessage,
-    ];
-    stream.submit(
-      { messages: outgoingMessages },
-      {
-        streamMode: ["values"],
-        optimisticValues: (prev) => ({
-          ...prev,
-          messages: [
-            ...(prev.messages ?? []),
-            ...toolMessages,
-            ...(systemMessage ? [systemMessage] : []),
-            newHumanMessage,
-          ],
-        }),
-      },
-    );
-
+    setInputError(null);
+    await stream.sendMessage(input);
     setInput("");
   };
 
-  const handleRegenerate = (
-    parentCheckpoint: Checkpoint | null | undefined,
-  ) => {
-    // Do this so the loading state is correct
-    prevMessageLength.current = prevMessageLength.current - 1;
-    setFirstTokenReceived(false);
-    stream.submit(undefined, {
-      checkpoint: parentCheckpoint,
-      streamMode: ["values"],
-    });
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) return;
+    await stream.login(email, password);
+    setPassword("");
   };
 
-  const assistantName = formatAssistantName(assistantId);
-  const chatStarted = !!threadId || !!messages.length;
-  const hasNoAIOrToolMessages = !messages.find(
-    (m) => m.type === "ai" || m.type === "tool",
-  );
+  const handleRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) return;
+    await stream.register(email, password);
+    setPassword("");
+  };
 
-  return (
-    <div className="flex w-full h-screen overflow-hidden">
-      <div className="relative lg:flex hidden">
-        <motion.div
-          className="absolute h-full border-r bg-white overflow-hidden z-20"
-          style={{ width: 300 }}
-          animate={
-            isLargeScreen
-              ? { x: chatHistoryOpen ? 0 : -300 }
-              : { x: chatHistoryOpen ? 0 : -300 }
-          }
-          initial={{ x: -300 }}
-          transition={
-            isLargeScreen
-              ? { type: "spring", stiffness: 300, damping: 30 }
-              : { duration: 0 }
-          }
-        >
-          <div className="relative h-full" style={{ width: 300 }}>
-            <ThreadHistory />
+  if (!hasSession) {
+    return (
+      <div className="flex min-h-screen w-full items-center justify-center p-4">
+        <div className="animate-in fade-in-0 zoom-in-95 bg-background flex w-full max-w-md flex-col rounded-lg border shadow-lg">
+          <div className="mt-10 flex flex-col gap-2 border-b p-6">
+            <div className="flex flex-col items-start gap-2">
+              <LangGraphLogoSVG className="h-7" />
+              <h1 className="text-xl font-semibold tracking-tight">
+                Agent Chat
+              </h1>
+            </div>
+            <p className="text-muted-foreground text-sm">
+              Log in to start a chat session.
+            </p>
           </div>
-        </motion.div>
-      </div>
-      <motion.div
-        className={cn(
-          "flex-1 flex flex-col min-w-0 overflow-hidden relative",
-          !chatStarted && "grid-rows-[1fr]",
-        )}
-        layout={isLargeScreen}
-        animate={{
-          marginLeft: chatHistoryOpen ? (isLargeScreen ? 300 : 0) : 0,
-          width: chatHistoryOpen
-            ? isLargeScreen
-              ? "calc(100% - 300px)"
-              : "100%"
-            : "100%",
-        }}
-        transition={
-          isLargeScreen
-            ? { type: "spring", stiffness: 300, damping: 30 }
-            : { duration: 0 }
-        }
-      >
-        {!chatStarted && (
-          <div className="absolute top-0 left-0 w-full flex items-center justify-between gap-3 p-2 pl-4 z-10">
-            <div>
-              {(!chatHistoryOpen || !isLargeScreen) && (
-                <Button
-                  className="hover:bg-gray-100"
-                  variant="ghost"
-                  onClick={() => setChatHistoryOpen((p) => !p)}
-                >
-                  {chatHistoryOpen ? (
-                    <PanelRightOpen className="size-5" />
-                  ) : (
-                    <PanelRightClose className="size-5" />
-                  )}
-                </Button>
+          <form
+            onSubmit={authMode === "login" ? handleLogin : handleRegister}
+            className="bg-muted/50 flex flex-col gap-4 p-6"
+          >
+            <div className="flex flex-col gap-2">
+              <Input
+                id="email"
+                name="email"
+                type="email"
+                placeholder="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+              />
+            </div>
+            <div className="flex flex-col gap-2">
+              <PasswordInput
+                id="password"
+                name="password"
+                placeholder="Password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+              />
+              {authMode === "register" && (
+                <p className="text-xs text-muted-foreground">
+                  Password must include uppercase, lowercase, number, and a
+                  special character.
+                </p>
               )}
             </div>
-            <div className="absolute top-2 right-4 flex items-center">
-              <OpenGitHubRepo />
-            </div>
-          </div>
-        )}
-        {chatStarted && (
-          <div className="flex items-center justify-between gap-3 p-2 z-10 relative">
-            <div className="flex items-center justify-start gap-2 relative">
-              <div className="absolute left-0 z-10">
-                {(!chatHistoryOpen || !isLargeScreen) && (
-                  <Button
-                    className="hover:bg-gray-100"
-                    variant="ghost"
-                    onClick={() => setChatHistoryOpen((p) => !p)}
-                  >
-                    {chatHistoryOpen ? (
-                      <PanelRightOpen className="size-5" />
-                    ) : (
-                      <PanelRightClose className="size-5" />
-                    )}
-                  </Button>
-                )}
-              </div>
-              <motion.button
-                className="flex gap-2 items-center cursor-pointer"
-                onClick={() => setThreadId(null)}
-                animate={{
-                  marginLeft: !chatHistoryOpen ? 48 : 0,
-                }}
-                transition={{
-                  type: "spring",
-                  stiffness: 300,
-                  damping: 30,
-                }}
-              >
-                <LangGraphLogoSVG width={32} height={32} />
-                <span className="text-xl font-semibold tracking-tight">
-                  {assistantName}
-                </span>
-              </motion.button>
-            </div>
-
-            <div className="flex items-center gap-4">
-              <div className="flex items-center">
-                <OpenGitHubRepo />
-              </div>
-              <TooltipIconButton
-                size="lg"
-                className="p-4"
-                tooltip="New thread"
+            {error && <div className="text-sm text-rose-600">{error}</div>}
+            <div className="flex items-center justify-between">
+              <Button
+                type="button"
                 variant="ghost"
-                onClick={() => setThreadId(null)}
+                onClick={() =>
+                  setAuthMode((prev) =>
+                    prev === "login" ? "register" : "login",
+                  )
+                }
               >
-                <SquarePen className="size-5" />
-              </TooltipIconButton>
+                {authMode === "login"
+                  ? "Create account"
+                  : "Use existing account"}
+              </Button>
+              <Button type="submit" disabled={isLoading}>
+                {isLoading
+                  ? authMode === "login"
+                    ? "Signing in..."
+                    : "Creating..."
+                  : authMode === "login"
+                    ? "Sign in"
+                    : "Create account"}
+              </Button>
             </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
-            <div className="absolute inset-x-0 top-full h-5 bg-gradient-to-b from-background to-background/0" />
+  return (
+    <div className="flex h-screen w-full overflow-hidden">
+      <aside className="w-64 border-r bg-muted/30">
+        <div className="flex items-center justify-between border-b px-4 py-3">
+          <p className="text-sm font-semibold">Sessions</p>
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => stream.refreshSessions()}
+              disabled={sessionsLoading}
+            >
+              Refresh
+            </Button>
+            <Button size="sm" onClick={() => stream.createSession()}>
+              New
+            </Button>
           </div>
-        )}
+        </div>
+        <div className="h-full overflow-auto px-2 py-3">
+          {sessionsLoading && (
+            <div className="px-2 text-xs text-muted-foreground">
+              Loading sessions...
+            </div>
+          )}
+          {!sessionsLoading && sessions.length === 0 && (
+            <div className="px-2 text-xs text-muted-foreground">
+              No sessions yet.
+            </div>
+          )}
+          <div className="flex flex-col gap-1">
+            {sessions.map((session) => {
+              const isActive = session.session_id === currentSessionId;
+              return (
+                <button
+                  key={session.session_id}
+                  type="button"
+                  onClick={() => stream.selectSession(session)}
+                  className={`flex w-full items-center rounded-md px-3 py-2 text-left text-sm transition ${
+                    isActive
+                      ? "bg-white text-foreground shadow"
+                      : "text-muted-foreground hover:bg-white/60 hover:text-foreground"
+                  }`}
+                >
+                  {formatSessionLabel(session.session_id, session.name)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </aside>
 
-        <StickToBottom className="relative flex-1 overflow-hidden">
-          <StickyToBottomContent
-            className={cn(
-              "absolute px-4 inset-0 overflow-y-scroll [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-track]:bg-transparent",
-              !chatStarted && "flex flex-col items-stretch mt-[25vh]",
-              chatStarted && "grid grid-rows-[1fr_auto]",
-            )}
-            contentClassName="pt-8 pb-16  max-w-3xl mx-auto flex flex-col gap-4 w-full"
-            content={
-              <>
-                {messages
-                  .filter((m) => !m.id?.startsWith(DO_NOT_RENDER_ID_PREFIX))
-                  .map((message, index) =>
-                    message.type === "human" ? (
-                      <HumanMessage
-                        key={message.id || `${message.type}-${index}`}
-                        message={message}
-                        isLoading={isLoading}
-                      />
-                    ) : message.type === "system" ? (
-                      showSystemMessages ? (
-                        <SystemMessage
-                          key={message.id || `${message.type}-${index}`}
-                          message={message}
-                        />
-                      ) : null
-                    ) : (
-                      <AssistantMessage
-                        key={message.id || `${message.type}-${index}`}
-                        message={message}
-                        isLoading={isLoading}
-                        handleRegenerate={handleRegenerate}
-                      />
-                    ),
-                  )}
-                {/* Special rendering case where there are no AI/tool messages, but there is an interrupt.
-                    We need to render it outside of the messages list, since there are no messages to render */}
-                {hasNoAIOrToolMessages && !!stream.interrupt && (
-                  <AssistantMessage
-                    key="interrupt-msg"
-                    message={undefined}
-                    isLoading={isLoading}
-                    handleRegenerate={handleRegenerate}
-                  />
-                )}
-                {isLoading && !firstTokenReceived && (
-                  <AssistantMessageLoading />
-                )}
-              </>
+      <div className="flex h-full w-full flex-col">
+        <header className="flex items-center justify-between border-b px-4 py-3">
+          <div className="flex items-center gap-3">
+            <LangGraphLogoSVG className="h-6 w-6" />
+            <div>
+              <p className="text-sm font-semibold leading-none">Agent Chat</p>
+              <p className="text-xs text-muted-foreground">
+              Connected to FastAPI backend
+            </p>
+          </div>
+        </div>
+        <Button variant="ghost" onClick={stream.logout}>
+          Log out
+        </Button>
+      </header>
+
+      <main className="flex-1 overflow-auto px-4 py-6">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+          {messages.length === 0 && (
+            <div className="text-muted-foreground text-sm">
+              Send a message to start the conversation.
+            </div>
+          )}
+          {messages.map((message) => {
+            if (message.role === "system") {
+              return <SystemMessage key={message.id} message={message} />;
             }
-            footer={
-              <div className="sticky flex flex-col items-center gap-8 bottom-0 bg-white">
-                {!chatStarted && (
-                  <div className="flex gap-3 items-center">
-                    <LangGraphLogoSVG className="flex-shrink-0 h-8" />
-                    <h1 className="text-2xl font-semibold tracking-tight">
-                      {assistantName}
-                    </h1>
-                  </div>
-                )}
-
-                <ScrollToBottom className="absolute bottom-full left-1/2 -translate-x-1/2 mb-4 animate-in fade-in-0 zoom-in-95" />
-
-                <div className="bg-muted rounded-2xl border shadow-xs mx-auto mb-8 w-full max-w-3xl relative z-10">
-                  <form
-                    onSubmit={handleSubmit}
-                    className="grid grid-rows-[1fr_auto] gap-2 max-w-3xl mx-auto"
-                  >
-                    <textarea
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (
-                          e.key === "Enter" &&
-                          !e.shiftKey &&
-                          !e.metaKey &&
-                          !e.nativeEvent.isComposing
-                        ) {
-                          e.preventDefault();
-                          const el = e.target as HTMLElement | undefined;
-                          const form = el?.closest("form");
-                          form?.requestSubmit();
-                        }
-                      }}
-                      placeholder="Type your message..."
-                      className="p-3.5 pb-0 border-none bg-transparent field-sizing-content shadow-none ring-0 outline-none focus:outline-none focus:ring-0 resize-none"
-                    />
-
-                    <div className="flex items-center justify-between p-2 pt-4">
-                      <div>
-                        <div className="flex items-center space-x-2">
-                          <Switch
-                            id="render-tool-calls"
-                            checked={hideToolCalls ?? false}
-                            onCheckedChange={setHideToolCalls}
-                          />
-                          <Label
-                            htmlFor="render-tool-calls"
-                            className="text-sm text-gray-600"
-                          >
-                            Hide Tool Calls
-                          </Label>
-                        </div>
-                      </div>
-                      {stream.isLoading ? (
-                        <Button key="stop" onClick={() => stream.stop()}>
-                          <LoaderCircle className="w-4 h-4 animate-spin" />
-                          Cancel
-                        </Button>
-                      ) : (
-                        <Button
-                          type="submit"
-                          className="transition-all shadow-md"
-                          disabled={isLoading || !input.trim()}
-                        >
-                          Send
-                        </Button>
-                      )}
-                    </div>
-                  </form>
-                </div>
-              </div>
+            if (message.role === "user") {
+              return <HumanMessage key={message.id} message={message} />;
             }
+            return <AssistantMessage key={message.id} message={message} />;
+          })}
+          {isLoading &&
+            (!lastMessage ||
+              lastMessage.role !== "assistant" ||
+              lastMessage.content.length === 0) && <AssistantMessageLoading />}
+        </div>
+      </main>
+
+      <footer className="border-t px-4 py-4">
+        <form
+          onSubmit={handleSubmit}
+          className="mx-auto flex w-full max-w-3xl flex-col gap-2"
+        >
+          <Textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Type your message..."
+            rows={3}
           />
-        </StickToBottom>
-      </motion.div>
+          {inputError && (
+            <div className="text-sm text-rose-600">{inputError}</div>
+          )}
+          {error && <div className="text-sm text-rose-600">{error}</div>}
+          <div className="flex items-center justify-between">
+            <div className="text-xs text-muted-foreground">
+              Max 3000 characters.
+            </div>
+            {isLoading ? (
+              <Button type="button" variant="secondary" onClick={stream.stop}>
+                Stop
+              </Button>
+            ) : (
+              <Button type="submit">Send</Button>
+            )}
+          </div>
+        </form>
+      </footer>
+      </div>
     </div>
   );
 }
